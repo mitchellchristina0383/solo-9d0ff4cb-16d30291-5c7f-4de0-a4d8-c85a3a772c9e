@@ -55,6 +55,57 @@
   </table>
 </section>
 
+<section class="panel" id="trial-panel">
+  <h2>顺序试跑 <small>同一份已提交快照，正反两种顺序各跑一次；只读，不影响正式演练</small></h2>
+  <p class="hint">
+    取当前进行中轮次（或下方指定的已提交轮次）在取快照那一刻的档位、样例与回执，
+    把时钟固定在取快照时刻。选两个动作，分别按「先 A 后 B」和「先 B 后 A」执行，
+    对比有效回执数、轮次结论和档位。两种顺序各自从同一快照克隆独立状态，互不影响。
+  </p>
+  <div class="trial-form">
+    <label>快照轮次
+      <select id="trial-round"><option value="">当前进行中轮次</option></select>
+    </label>
+    <div class="trial-actions">
+      <fieldset class="trial-action">
+        <legend>动作 A</legend>
+        <select id="trial-a-type">
+          <option value="receipt">回填回执</option>
+          <option value="confirm">确认放量</option>
+          <option value="expire">置超时</option>
+        </select>
+        <select id="trial-a-request" class="trial-req"></select>
+        <select id="trial-a-success" class="trial-success">
+          <option value="1">成功</option>
+          <option value="0">失败</option>
+        </select>
+      </fieldset>
+      <fieldset class="trial-action">
+        <legend>动作 B</legend>
+        <select id="trial-b-type">
+          <option value="receipt">回填回执</option>
+          <option value="confirm">确认放量</option>
+          <option value="expire">置超时</option>
+        </select>
+        <select id="trial-b-request" class="trial-req"></select>
+        <select id="trial-b-success" class="trial-success">
+          <option value="1">成功</option>
+          <option value="0">失败</option>
+        </select>
+      </fieldset>
+    </div>
+    <button id="btn-trial">按两种顺序试跑</button>
+    <span id="trial-msg" class="msg"></span>
+  </div>
+  <div id="trial-result" class="hidden">
+    <div id="trial-snapshot" class="trial-snapshot"></div>
+    <h3>逐步受理过程</h3>
+    <div id="trial-runs" class="trial-runs"></div>
+    <h3>顺序对照</h3>
+    <div id="trial-compare"></div>
+  </div>
+</section>
+
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

@@ -81,6 +81,21 @@ def db_cursor(immediate: bool = False):
         conn.close()
 
 
+@contextmanager
+def read_snapshot_cursor():
+    """只读快照连接：显式 BEGIN，调用方只允许 SELECT，结束时一律 rollback。
+
+    试跑取快照专用于此，确保不会把任何内容写回正式库。
+    """
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
 def init_db() -> None:
     # 目录可能由 compose 卷挂载而来，确保存在
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)

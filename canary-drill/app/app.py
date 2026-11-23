@@ -10,21 +10,19 @@
 6. 确认走 BEGIN IMMEDIATE 事务 + 状态机校验，并发确认只推进一次。
 7. 回执始终挂在"请求发出时的轮次和版本"上（requests 行不可变），
    换轮后的旧回执天然无法影响新轮判定。
+8. 受理/判定规则集中在 app/rules.py，正式接口与顺序试跑（app/trial.py）共用；
+   试跑只读快照并在内存副本上推演，不写正式库。
 """
 from __future__ import annotations
 
-import math
-import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, render_template, request
 
-from .db import db_cursor, get_conn, init_db
-
-WINDOW_SECONDS = int(os.environ.get("CANARY_WINDOW_SECONDS", "30"))
-SAMPLE_SIZE = 10
-STEP_PCT = 10
+from .config import SAMPLE_SIZE, WINDOW_SECONDS
+from .db import db_cursor, get_conn, init_db, read_snapshot_cursor
+from . import rules, trial
 
 app = Flask(__name__)
 
@@ -43,8 +41,7 @@ def iso(dt: datetime) -> str:
 
 def split_counts(rollout_pct: int) -> tuple[int, int]:
     """按当前比例拆分 10 笔样例：返回 (新版笔数, 旧版笔数)。"""
-    new_n = math.floor(rollout_pct / 100 * SAMPLE_SIZE + 1e-9)
-    return new_n, SAMPLE_SIZE - new_n
+    return rules.split_counts(rollout_pct)
 
 
 def sweep_expired(conn: sqlite3.Connection, now: datetime) -> None:
@@ -54,10 +51,10 @@ def sweep_expired(conn: sqlite3.Connection, now: datetime) -> None:
         UPDATE rounds
            SET status = 'expired',
                closed_at = ?,
-               decision_note = '超过 ' || ? || ' 秒未收齐回执，留在原档，可重开采样'
+               decision_note = ?
          WHERE status = 'open' AND deadline_at < ?
         """,
-        (iso(now), WINDOW_SECONDS, iso(now)),
+        (iso(now), rules.sweep_note(WINDOW_SECONDS), iso(now)),
     )
 
 
@@ -240,10 +237,11 @@ def api_receipt(request_id: int):
         existed = conn.execute(
             "SELECT id FROM receipts WHERE request_id = ?", (request_id,)
         ).fetchone()
-        if existed:
-            return jsonify({"ok": False, "error": "该笔已有回执，以首个回执为准，重复回填被忽略"}), 409
+        gate = rules.receipt_gate(req_row["round_status"], existed is not None)
+        if not gate["accepted"]:
+            return jsonify({"ok": False, "error": gate["error"]}), 409
 
-        late = 1 if req_row["round_status"] != "open" else 0
+        late = 1 if gate["late"] else 0
         try:
             conn.execute(
                 "INSERT INTO receipts(request_id, round_id, version, success, late, received_at) "
@@ -275,22 +273,6 @@ def api_confirm(round_id: int):
         row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
         if row is None:
             return jsonify({"ok": False, "error": "轮次不存在"}), 404
-        if row["status"] != "open":
-            return jsonify(
-                {"ok": False, "error": f"轮次已结束（{row['status']}），确认只生效一次，旧确认不能再次推进放量"}
-            ), 409
-
-        if now >= datetime.fromisoformat(row["deadline_at"]):
-            conn.execute(
-                "UPDATE rounds SET status = 'expired', closed_at = ?, "
-                "decision_note = ? WHERE id = ?",
-                (
-                    iso(now),
-                    f"超过 {WINDOW_SECONDS} 秒未收齐回执，留在 {row['rollout_pct']}% 档，可重开采样",
-                    round_id,
-                ),
-            )
-            return jsonify({"ok": False, "error": "已超时，本轮留在原档，可重开采样"}), 409
 
         counts = conn.execute(
             """
@@ -306,42 +288,35 @@ def api_confirm(round_id: int):
         stat = {c["version"]: (c["received"] or 0, c["fail"] or 0) for c in counts}
         new_recv, new_fail = stat.get("new", (0, 0))
         old_recv, old_fail = stat.get("old", (0, 0))
-        total_recv = new_recv + old_recv
 
-        if total_recv < SAMPLE_SIZE:
-            return jsonify(
-                {"ok": False, "error": f"回执未收齐（{total_recv}/{SAMPLE_SIZE}），值班员需等本档结果齐全再放量"}
-            ), 409
-
-        new_rate = new_fail / new_recv if new_recv else 0.0
-        old_rate = old_fail / old_recv if old_recv else 0.0
-        note = (
-            f"{WINDOW_SECONDS}s 内收齐 10 笔；新版失败 {new_fail}/{new_recv}"
-            f"（{new_rate:.0%}），旧版失败 {old_fail}/{old_recv}（{old_rate:.0%}）"
-        )
-
-        if new_rate > old_rate:
-            conn.execute(
-                "UPDATE rounds SET status = 'rejected', closed_at = ?, decision_note = ? WHERE id = ?",
-                (iso(now), note + "；新版失败率高于旧版，留在原档，可重开采样", round_id),
-            )
-            return jsonify(
-                {"ok": False, "error": f"新版失败率 {new_rate:.0%} 高于旧版 {old_rate:.0%}，留在原档"}
-            ), 409
-
+        # 正式流程以 meta 当前档位为准（与轮次发出档位一致；轮次未关闭时不应漂移）
         meta = conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
-        next_pct = min(100, meta["rollout_pct"] + STEP_PCT)
-        finished = 1 if next_pct >= 100 else 0
-        conn.execute(
-            "UPDATE rounds SET status = 'confirmed', closed_at = ?, decision_note = ? WHERE id = ?",
-            (iso(now), note + f"；满足条件，放量 {meta['rollout_pct']}% -> {next_pct}%", round_id),
+        verdict = rules.confirm_gate(
+            round_status=row["status"],
+            now=now,
+            deadline_at=datetime.fromisoformat(row["deadline_at"]),
+            rollout_pct=meta["rollout_pct"],
+            new_recv=new_recv,
+            new_fail=new_fail,
+            old_recv=old_recv,
+            old_fail=old_fail,
+            window_seconds=WINDOW_SECONDS,
         )
+
+        if verdict["close_round"]:
+            conn.execute(
+                "UPDATE rounds SET status = ?, closed_at = ?, decision_note = ? WHERE id = ?",
+                (verdict["round_status"], iso(now), verdict["decision_note"], round_id),
+            )
+        if not verdict["accepted"]:
+            return jsonify({"ok": False, "error": verdict["error"]}), 409
+
         conn.execute(
             "UPDATE meta SET rollout_pct = ?, finished = ? WHERE id = 1",
-            (next_pct, finished),
+            (verdict["next_pct"], 1 if verdict["finished"] else 0),
         )
 
-    return jsonify({"ok": True, "next_pct": next_pct, "state": build_state()})
+    return jsonify({"ok": True, "next_pct": verdict["next_pct"], "state": build_state()})
 
 
 # 测试/演练辅助：立即把进行中的轮次按超时关闭（正常情况下由 30 秒截止自动触发）
@@ -352,18 +327,36 @@ def api_expire(round_id: int):
         row = conn.execute("SELECT * FROM rounds WHERE id = ?", (round_id,)).fetchone()
         if row is None:
             return jsonify({"ok": False, "error": "轮次不存在"}), 404
-        if row["status"] != "open":
-            return jsonify({"ok": False, "error": f"轮次已结束（{row['status']}）"}), 409
+        verdict = rules.expire_gate(row["status"], row["rollout_pct"])
+        if not verdict["accepted"]:
+            return jsonify({"ok": False, "error": verdict["error"]}), 409
         conn.execute(
-            "UPDATE rounds SET status = 'expired', closed_at = ?, "
-            "decision_note = ? WHERE id = ?",
-            (
-                iso(now),
-                f"手动置超时（演练辅助）：留在 {row['rollout_pct']}% 档，可重开采样",
-                round_id,
-            ),
+            "UPDATE rounds SET status = ?, closed_at = ?, decision_note = ? WHERE id = ?",
+            (verdict["round_status"], iso(now), verdict["decision_note"], round_id),
         )
     return jsonify({"ok": True, "state": build_state()})
+
+
+# ---------------------------------------------------------------------------
+# 顺序试跑：同一份已提交快照，按正反两种顺序各跑两个动作
+# ---------------------------------------------------------------------------
+
+@app.post("/api/trial")
+def api_trial():
+    """试跑不写库：取快照后全程在内存副本上执行，两个顺序各自独立。"""
+    payload = request.get_json(silent=True) or {}
+    round_id = payload.get("round_id")
+    if round_id is not None and (not isinstance(round_id, int) or isinstance(round_id, bool)):
+        return jsonify({"ok": False, "error": "round_id 需要整数或留空"}), 400
+
+    now = now_dt()
+    try:
+        with read_snapshot_cursor() as conn:
+            snapshot = trial.snapshot_from_db(conn, now, round_id)
+        result = trial.run_trial(snapshot, payload.get("actions"))
+    except trial.TrialError as exc:
+        return jsonify({"ok": False, "error": exc.message}), exc.status
+    return jsonify({"ok": True, "trial": result})
 
 
 init_db()
