@@ -1,0 +1,15 @@
+services:
+  canary:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 采样截止窗口，默认 30 秒；测试晚到可临时改小
+      CANARY_WINDOW_SECONDS: "30"
+      CANARY_DB: "/data/canary.db"
+    volumes:
+      - canary-data:/data
+    restart: unless-stopped
+
+volumes:
+  canary-data:

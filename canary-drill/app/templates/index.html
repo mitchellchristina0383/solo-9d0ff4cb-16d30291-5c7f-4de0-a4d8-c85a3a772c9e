@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>灰度放量演练台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>灰度放量演练台</h1>
+  <div class="meta">
+    <span>当前新版流量：<strong id="rollout-pct">–</strong></span>
+    <span>每轮采样：10 笔，截止窗口 {{ window_seconds }} 秒</span>
+    <span id="server-time">服务器时间 –</span>
+  </div>
+</header>
+
+<section id="control">
+  <button id="btn-open">开一轮采样（按当前比例拆 10 笔）</button>
+  <button id="btn-confirm" disabled>确认放量（需窗口内收齐且新版失败率 ≤ 旧版）</button>
+  <button id="btn-expire" class="warn" disabled>演练辅助：立即置超时</button>
+  <span id="global-msg" class="msg"></span>
+</section>
+
+<section id="current-panel" class="panel hidden">
+  <h2>当前轮次 <small id="round-title"></small></h2>
+  <div id="round-banner" class="banner"></div>
+  <div class="versions">
+    <div class="ver new">
+      <h3>新版（new）</h3>
+      <div id="new-stat"></div>
+    </div>
+    <div class="ver old">
+      <h3>旧版（old）</h3>
+      <div id="old-stat"></div>
+    </div>
+  </div>
+  <h3>逐笔回填（每笔以首个回执为准）</h3>
+  <table>
+    <thead><tr><th>#</th><th>编号</th><th>版本</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody id="req-tbody"></tbody>
+  </table>
+  <h3>放量依据</h3>
+  <ul id="basis"></ul>
+</section>
+
+<section class="panel">
+  <h2>历史轮次</h2>
+  <table>
+    <thead>
+      <tr><th>轮次</th><th>发出档位</th><th>新/旧笔数</th><th>状态</th><th>判定依据</th></tr>
+    </thead>
+    <tbody id="history-tbody"></tbody>
+  </table>
+</section>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
